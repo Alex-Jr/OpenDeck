@@ -319,6 +319,19 @@ pub static CATEGORIES: Lazy<RwLock<HashMap<String, Category>>> = Lazy::new(|| {
 				.unwrap(),
 				serde_json::from_value(serde_json::json!(
 					{
+						"name": "Test Double Tap",
+						"icon": "opendeck/multi-action.png",
+						"plugin": "opendeck",
+						"uuid": "opendeck.doubletap",
+						"tooltip": "Execute multiple actions",
+						"controllers": [ "Keypad" ],
+						"states": [ { "image": "opendeck/multi-action.png" } ],
+						"supported_in_multi_actions": false
+					}
+				))
+				.unwrap(),
+				serde_json::from_value(serde_json::json!(
+					{
 						"name": "Toggle Action",
 						"icon": "opendeck/toggle-action.png",
 						"plugin": "opendeck",
