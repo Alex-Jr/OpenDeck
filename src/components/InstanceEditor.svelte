@@ -15,25 +15,23 @@
 	let fileInput: HTMLInputElement;
 	let colourInput: HTMLInputElement;
 
-	let isDragging = false;
-
 	function handleDrop(event: DragEvent) {
 		event.preventDefault();
-		isDragging = false;
 
 		const file = event.dataTransfer?.files?.[0];
-		if (file && file.type.startsWith("image/")) {
-			const reader = new FileReader();
-			reader.onload = async () => {
-				let result = reader.result?.toString();
-				if (result) {
-					let resized = await resizeImage(result);
-					if (resized) instance.states[state].image = resized;
-					else instance.states[state].image = result;
-				}
-			};
-			reader.readAsDataURL(file);
-		}
+		if (!file || !file.type.startsWith("image/")) return;
+		const reader = new FileReader();
+
+		reader.onload = async () => {
+			let result = reader.result?.toString();
+			if (result) {
+				let resized = await resizeImage(result);
+				if (resized) instance.states[state].image = resized;
+				else instance.states[state].image = result;
+			}
+		};
+
+		reader.readAsDataURL(file);
 	}
 
 	function update(instance: ActionInstance) {
@@ -65,15 +63,7 @@
 		<div class="flex flex-col justify-center items-center">
 			<button
 				on:drop={handleDrop}
-				on:dragstart={() => {
-					isDragging = true;
-				}}
-				on:dragover={(event) => {
-					event.preventDefault();
-				}}
-				on:dragleave={() => {
-					isDragging = false;
-				}}
+				on:dragover={(event) => event.preventDefault()}
 				on:click={() => fileInput.click()}
 				on:contextmenu={(event) => {
 					event.preventDefault();
