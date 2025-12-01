@@ -42,14 +42,17 @@
 		} else if (dataTransfer?.getData("controller")) {
 			let oldArray = dataTransfer?.getData("controller") == "Encoder" ? profile.sliders : profile.keys;
 			let oldPosition = parseInt(dataTransfer?.getData("position"));
-			let response: ActionInstance = await invoke("move_instance", {
+			let response: {
+				moved_instance: ActionInstance;
+				replaced_instance: ActionInstance | null;
+			} | null = await invoke("move_instance", {
 				source: { device: device.id, profile: profile.id, controller: dataTransfer?.getData("controller"), position: oldPosition },
 				destination: context,
 				retain: false,
 			});
 			if (response) {
-				array[position] = response;
-				oldArray[oldPosition] = null;
+				array[position] = response.moved_instance;
+				oldArray[oldPosition] = response.replaced_instance;
 				profile = profile;
 			}
 		}

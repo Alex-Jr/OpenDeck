@@ -1,5 +1,7 @@
 use super::Error;
 
+use std::path::Path;
+
 use crate::shared::{Action, ActionContext, ActionInstance, Context, config_dir};
 use crate::store::profiles::{LocksMut, acquire_locks_mut, get_instance_mut, get_slot_mut, save_profile};
 
@@ -76,72 +78,116 @@ fn instance_images_dir(context: &ActionContext) -> std::path::PathBuf {
 		.join(format!("{}.{}.{}", context.controller, context.position, context.index))
 }
 
+fn update_children_and_states(instance: &mut ActionInstance, base_context: &Context, old_dir: &Path, new_dir: &Path) {
+    instance.context = ActionContext::from_context(base_context.clone(), 0);
+
+	if let Some(children) = &mut instance.children {
+        for (index, child) in children.iter_mut().enumerate() {
+            child.context = ActionContext::from_context(base_context.clone(), index as u16 + 1);
+            for (i, state) in child.states.iter_mut().enumerate() {
+                state.image = if !child.action.states[i].image.is_empty() {
+                    child.action.states[i].image.clone()
+                } else {
+                    child.action.icon.clone()
+                };
+            }
+        }
+    }
+
+	for state in instance.states.iter_mut() {
+        let path = Path::new(&state.image);
+
+        if let Ok(rel) = path.strip_prefix(old_dir) {
+            state.image = new_dir.join(rel).to_string_lossy().into_owned();
+        }
+    }
+}
+
+
+#[derive(Clone, serde::Serialize)]
+pub struct MoveInstanceResponse {
+	moved_instance: ActionInstance,
+	replaced_instance: Option<ActionInstance>,
+}
+
 #[command]
-pub async fn move_instance(source: Context, destination: Context, retain: bool) -> Result<Option<ActionInstance>, Error> {
-	if source.controller != destination.controller {
-		return Ok(None);
-	}
+pub async fn move_instance(source: Context, destination: Context, retain: bool) -> Result<Option<MoveInstanceResponse>, Error> {
+    if source.controller != destination.controller || (
+		source.position == destination.position && 
+		source.profile == destination.profile && 
+		source.device == destination.device
+	) {
+        return Ok(None);
+    }
 
-	{
-		let locks = crate::store::profiles::acquire_locks().await;
-		let dst = crate::store::profiles::get_slot(&destination, &locks).await?;
-		if dst.is_some() {
-			return Ok(None);
+    let mut locks = acquire_locks_mut().await;
+    
+	let mut src_instance = {
+		let src_slot: &mut Option<ActionInstance> = get_slot_mut(&source, &mut locks).await?;
+
+		let instance = if retain {
+			src_slot.clone()
+		} else {
+			src_slot.take()
+		};
+
+		match instance {
+			Some(i) => { i },
+			_ => return Ok(None),
 		}
-	}
-
-	let mut locks = acquire_locks_mut().await;
-	let src = get_slot_mut(&source, &mut locks).await?;
-
-	let Some(mut new) = src.clone() else {
-		return Ok(None);
 	};
-	new.context = ActionContext::from_context(destination.clone(), 0);
-	if let Some(children) = &mut new.children {
-		for (index, instance) in children.iter_mut().enumerate() {
-			instance.context = ActionContext::from_context(destination.clone(), index as u16 + 1);
-			for (i, state) in instance.states.iter_mut().enumerate() {
-				if !instance.action.states[i].image.is_empty() {
-					state.image = instance.action.states[i].image.clone();
-				} else {
-					state.image = instance.action.icon.clone();
-				}
-			}
-		}
+
+	let mut dst_instance = {
+		let dst_slot: &mut Option<ActionInstance> = get_slot_mut(&destination, &mut locks).await?;
+
+		dst_slot.clone()
+	};
+
+	let src_dir = instance_images_dir(&ActionContext::from_context(source.clone(), 0));
+	let dst_dir = instance_images_dir(&ActionContext::from_context(destination.clone(), 0));
+
+	let had_old = src_dir.exists();
+	let had_new = dst_dir.exists();
+
+	let tmp_dir = dst_dir.with_file_name("tmp_swap_dir");
+	let _ = tokio::fs::create_dir_all(&dst_dir).await;
+	let _ = tokio::fs::create_dir_all(&src_dir).await;
+	let _ = tokio::fs::create_dir_all(&tmp_dir).await;
+	let _ = tokio::fs::rename(&dst_dir, &tmp_dir).await;
+	let _ = tokio::fs::rename(&src_dir, &dst_dir).await;
+	let _ = tokio::fs::rename(&tmp_dir, &src_dir).await;
+	let _ = remove_dir_all(&tmp_dir).await;
+
+	if !had_old {
+		let _ = remove_dir_all(&dst_dir).await;
 	}
 
-	let old_dir = instance_images_dir(&src.as_ref().unwrap().context);
-	let new_dir = instance_images_dir(&new.context);
-	let _ = tokio::fs::create_dir_all(&new_dir).await;
-	if let Ok(files) = old_dir.read_dir() {
-		for file in files.flatten() {
-			let _ = tokio::fs::copy(file.path(), new_dir.join(file.file_name())).await;
-		}
+	if !had_new {
+		let _ = remove_dir_all(&src_dir).await;
 	}
-	for state in new.states.iter_mut() {
-		let path = std::path::Path::new(&state.image);
-		if path.starts_with(&old_dir) {
-			state.image = new_dir.join(path.strip_prefix(&old_dir).unwrap()).to_string_lossy().into_owned();
-		}
-	}
-
-	let dst = get_slot_mut(&destination, &mut locks).await?;
-	*dst = Some(new.clone());
-
+	
 	if !retain {
-		let src = get_slot_mut(&source, &mut locks).await?;
-		if let Some(old) = src {
-			let _ = crate::events::outbound::will_appear::will_disappear(old, true).await;
-			let _ = remove_dir_all(instance_images_dir(&old.context)).await;
-		}
-		*src = None;
+		let _ = crate::events::outbound::will_appear::will_disappear(&src_instance, true).await;
+	}
+    update_children_and_states(&mut src_instance, &destination, &src_dir, &dst_dir);
+	let dst_slot = get_slot_mut(&destination, &mut locks).await?;
+	*dst_slot = Some(src_instance.clone());
+	let _ = crate::events::outbound::will_appear::will_appear(&src_instance).await;
+
+	if let Some(ref mut dst_instance) = dst_instance {
+		let _ = crate::events::outbound::will_appear::will_disappear(dst_instance, true).await;
+		update_children_and_states(dst_instance, &source, &dst_dir, &src_dir);
+		let src_slot = get_slot_mut(&source, &mut locks).await?;
+		*src_slot = Some(dst_instance.clone());
+		let _ = crate::events::outbound::will_appear::will_appear(dst_instance).await;
 	}
 
-	let _ = crate::events::outbound::will_appear::will_appear(&new).await;
-
-	save_profile(&destination.device, &mut locks).await?;
-
-	Ok(Some(new))
+    save_profile(&destination.device, &mut locks).await?;
+	
+    Ok(Some(MoveInstanceResponse {
+		moved_instance: src_instance,
+		replaced_instance: dst_instance,
+	}))
 }
 
 #[command]
