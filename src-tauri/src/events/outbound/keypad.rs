@@ -4,6 +4,12 @@ use crate::events::frontend::instances::{key_moved, update_state};
 use crate::shared::{ActionContext, Context};
 use crate::store::profiles::{acquire_locks_mut, get_slot_mut, save_profile};
 
+use tokio::time::sleep;
+
+use std::any;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -16,6 +22,14 @@ struct KeyEvent {
 	device: String,
 	payload: GenericInstancePayload,
 }
+
+#[derive(Debug)]
+struct KeyState {
+	count: u8,
+}
+
+static KEY_STATES: LazyLock<Mutex<HashMap<(String, u8), KeyState>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 
 pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
 	let mut locks = acquire_locks_mut().await;
@@ -31,6 +45,7 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
 
 	let Some(instance) = get_slot_mut(&context, &mut locks).await? else { return Ok(()) };
 	if instance.action.uuid == "opendeck.multiaction" {
+		println!("multi action");
 		for child in instance.children.as_mut().unwrap() {
 			send_to_plugin(
 				&child.action.plugin,
@@ -71,7 +86,7 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
 		}
 
 		save_profile(device, &mut locks).await?;
-	} else if instance.action.uuid == "opendeck.toggleaction" {
+	} else if instance.action.uuid == "opendeck.toggleaction" {																												
 		let children = instance.children.as_ref().unwrap();
 		if children.is_empty() {
 			return Ok(());
@@ -88,6 +103,134 @@ pub async fn key_down(device: &str, key: u8) -> Result<(), anyhow::Error> {
 			},
 		)
 		.await?;
+	} else if instance.action.uuid == "opendeck.doubletap" {
+		println!("tap");
+		let children = instance.children.clone().unwrap(); // clone para mover para spawn
+		if children.is_empty() {
+			return Ok(());
+		}
+
+		let id = (device.to_string(), key);
+
+		let mut states = KEY_STATES.lock().unwrap();
+
+		println!("Key states: {:?}", states);
+
+		if let Some(state) = states.get_mut(&id) {
+			state.count += 1;
+			return Ok(());
+		}
+
+		states.insert(id.clone(), KeyState { count: 1 });
+
+		drop(states);
+
+		tokio::spawn(async move {
+			let res: anyhow::Result<()> = async {
+				sleep(Duration::from_millis(200)).await;
+
+				let action_to_run = {
+					let mut states = KEY_STATES.lock().unwrap();
+
+					if let Some(state) = states.remove(&id) {
+						if state.count == 1 { "single" } else { "double" }
+					} else {
+						return Ok(());
+					}
+				};
+
+				match action_to_run {
+					"single" => {
+						let mut locks = acquire_locks_mut().await;
+
+						let Some(instance) = get_slot_mut(&context, &mut locks).await? else { return Ok(()) };
+
+						println!("single tap");
+						let children = instance.children.as_mut().unwrap(); // clone para mover para spawn
+
+						if children.is_empty() {
+							return Ok(());
+						}
+
+						let _ = send_to_plugin(
+							&children[0].action.plugin,
+							&KeyEvent {
+								event: "keyDown",
+								action: children[0].action.uuid.clone(),
+								context: children[0].context.clone(),
+								device: children[0].context.device.clone(),
+								payload: GenericInstancePayload::new(&children[0]),
+							},
+						)
+						.await?;
+
+						if children[0].states.len() == 2 && !children[0].action.disable_automatic_states {
+							children[0].current_state = (children[0].current_state + 1) % (children[0].states.len() as u16);
+						}
+
+						let _ = send_to_plugin(
+							&children[0].action.plugin,
+							&KeyEvent {
+								event: "keyUp",
+								action: children[0].action.uuid.clone(),
+								context: children[0].context.clone(),
+								device: children[0].context.device.clone(),
+								payload: GenericInstancePayload::new(&children[0]),
+							},
+						)
+						.await?;
+
+						Ok(())
+					}
+					"double" => {
+						println!("double tap");
+						let mut locks = acquire_locks_mut().await;
+
+						let Some(instance) = get_slot_mut(&context, &mut locks).await? else { return Ok(()) };
+						if children.len() < 2 {
+							return Ok(());
+						}
+						let children = instance.children.as_mut().unwrap(); // clone para mover para spawn
+
+						let _ = send_to_plugin(
+							&children[1].action.plugin,
+							&KeyEvent {
+								event: "keyDown",
+								action: children[1].action.uuid.clone(),
+								context: children[1].context.clone(),
+								device: children[1].context.device.clone(),
+								payload: GenericInstancePayload::new(&children[1]),
+							},
+						)
+						.await?;
+
+						if children[1].states.len() == 2 && !children[1].action.disable_automatic_states {
+							children[1].current_state = (children[1].current_state + 1) % (children[1].states.len() as u16);
+						}
+
+						let _ = send_to_plugin(
+							&children[1].action.plugin,
+							&KeyEvent {
+								event: "keyUp",
+								action: children[1].action.uuid.clone(),
+								context: children[1].context.clone(),
+								device: children[1].context.device.clone(),
+								payload: GenericInstancePayload::new(&children[1]),
+							},
+						)
+						.await?;
+
+						Ok(())
+					}
+					_ => Ok(()),
+				}
+			}
+			.await;
+
+			if let Err(e) = res {
+				eprintln!("Error in double tap handler: {:?}", e);
+			}
+		});
 	} else {
 		send_to_plugin(
 			&instance.action.plugin,

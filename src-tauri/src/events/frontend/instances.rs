@@ -51,7 +51,7 @@ pub async fn create_instance(app: AppHandle, action: Action, context: Context) -
 			states: action.states.clone(),
 			current_state: 0,
 			settings: serde_json::Value::Object(serde_json::Map::new()),
-			children: if matches!(action.uuid.as_str(), "opendeck.multiaction" | "opendeck.toggleaction") {
+			children: if matches!(action.uuid.as_str(), "opendeck.multiaction" | "opendeck.toggleaction" | "opendeck.doubletap") {
 				Some(vec![])
 			} else {
 				None
