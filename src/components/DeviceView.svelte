@@ -45,14 +45,14 @@
 			let oldController = dataTransfer?.getData("controller");
 			let oldArray = oldController == "Encoder" ? profile.sliders : oldController == "Infobar" ? profile.infobars : profile.keys;
 			let oldPosition = parseInt(dataTransfer?.getData("position"));
-			let response: ActionInstance = await invoke("move_instance", {
+			let response: [ActionInstance, ActionInstance | null] | null = await invoke("move_instance", {
 				source: { device: device.id, profile: profile.id, controller: oldController, position: oldPosition },
 				destination: context,
 				retain: false,
 			});
 			if (response) {
-				array[position] = response;
-				oldArray[oldPosition] = null;
+				// The source is empty after a move, or contains the displaced action after a swap.
+				[array[position], oldArray[oldPosition]] = response;
 				profile = profile;
 			}
 		}
@@ -68,9 +68,9 @@
 			return;
 		}
 
-		let response: ActionInstance = await invoke("move_instance", { source: item.source, destination, retain: true });
+		let response: [ActionInstance, ActionInstance | null] | null = await invoke("move_instance", { source: item.source, destination, retain: true });
 		if (response) {
-			array[destination.position] = response;
+			array[destination.position] = response[0];
 			profile = profile;
 		}
 	}

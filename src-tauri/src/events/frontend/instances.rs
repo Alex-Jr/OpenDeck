@@ -83,21 +83,67 @@ fn instance_images_dir(context: &ActionContext) -> std::path::PathBuf {
 		.join(format!("{}.{}.{}", context.controller, context.position, context.index))
 }
 
+// Embed position-owned images as data URLs so saving writes them at the new position.
+fn relocate_instance(instance: &mut ActionInstance, destination: &Context) -> Result<(), std::io::Error> {
+	use base64::Engine;
+	let images_dir = instance_images_dir(&instance.context);
+	for state in &mut instance.states {
+		for image in std::iter::once(&mut state.image).chain(state.image_override.iter_mut()) {
+			let path = std::path::Path::new(image);
+			if path.starts_with(&images_dir) {
+				let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("png");
+				let mime = if extension == "svg" { "svg+xml" } else { extension };
+				*image = format!("data:image/{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(std::fs::read(path)?));
+			}
+		}
+	}
+	instance.context = ActionContext::from_context(destination.clone(), instance.context.index);
+	if let Some(children) = &mut instance.children {
+		for child in children {
+			relocate_instance(child, destination)?;
+		}
+	}
+	Ok(())
+}
+
 #[command]
-pub async fn move_instance(source: Context, destination: Context, retain: bool) -> Result<Option<ActionInstance>, Error> {
-	if source.controller != destination.controller {
+pub async fn move_instance(source: Context, destination: Context, retain: bool) -> Result<Option<(ActionInstance, Option<ActionInstance>)>, Error> {
+	if source.controller != destination.controller || source == destination {
 		return Ok(None);
 	}
 
-	{
-		let locks = crate::store::profiles::acquire_locks().await;
-		let dst = crate::store::profiles::get_slot(&destination, &locks).await?;
-		if dst.is_some() {
+	let mut locks = acquire_locks_mut().await;
+	// Handles swapping instances between two positions
+	if get_slot_mut(&destination, &mut locks).await?.is_some() {
+		if retain || source.device != destination.device || source.profile != destination.profile {
 			return Ok(None);
 		}
+		let Some(mut first) = get_slot_mut(&source, &mut locks).await?.clone() else { return Ok(None) };
+		let Some(mut second) = get_slot_mut(&destination, &mut locks).await?.clone() else {
+			return Ok(None);
+		};
+		let old_first = first.clone();
+		let old_second = second.clone();
+		relocate_instance(&mut first, &destination)?;
+		relocate_instance(&mut second, &source)?;
+		// Notify plugins that the old contexts disappear before registering the new ones.
+		for instance in [&old_first, &old_second] {
+			for action in std::iter::once(instance).chain(instance.children.iter().flatten()) {
+				let _ = crate::events::outbound::will_appear::will_disappear(action, false).await;
+			}
+		}
+		*get_slot_mut(&source, &mut locks).await? = Some(second.clone());
+		*get_slot_mut(&destination, &mut locks).await? = Some(first.clone());
+		save_profile_now(&source.device, &mut locks).await?;
+		for instance in [&first, &second] {
+			for action in std::iter::once(instance).chain(instance.children.iter().flatten()) {
+				let _ = crate::events::outbound::will_appear::will_appear(action).await;
+			}
+		}
+		return Ok(Some((first, Some(second))));
 	}
 
-	let mut locks = acquire_locks_mut().await;
+	// Handles moving an instance to a new position, optionally retaining the original
 	let src = get_slot_mut(&source, &mut locks).await?;
 
 	let Some(mut new) = src.clone() else {
@@ -155,7 +201,7 @@ pub async fn move_instance(source: Context, destination: Context, retain: bool) 
 
 	save_profile_now(&destination.device, &mut locks).await?;
 
-	Ok(Some(new))
+	Ok(Some((new, None)))
 }
 
 #[command]
